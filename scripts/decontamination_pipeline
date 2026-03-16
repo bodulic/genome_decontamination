@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+#Defining usage and exiting (function)
+usage () {
+ echo "Genome decontamination pipeline, version 1.0.0" >&2
+ echo "USAGE ${0} [OPTIONS] GENOME TARGET_TAXON" >&2
+ echo "Supplementary file options:" >&2
+ echo "-n: Pre-generated DIAMOND NR database" >&2
+ echo "-d: Pre-generated unmeganized DIAMOND results" >&2
+ echo "-m: Pre-generated meganized DIAMOND results" >&2
+ echo "-k: Pre-generated Kraken2 core NT database index" >&2
+ echo "-K: Pre-generated Kraken2 results" >&2
+ echo "-T: Pre-generated Taxonomizr database" >&2
+ echo "DIAMOND run options:" >&2
+ echo "-f: Fast DIAMOND parameter preset, default: off" >&2
+ echo "-g: Number of splits performed on the genome, default: 1" >&2
+ echo "-s: Number of splits performed on the DIAMOND NR database, default: 2" >&2
+ echo "Contamination analysis options:" >&2
+ echo "-S: Random seed for reproducibility, default: 100" >&2
+ echo "-L: Minimum scaffold length for taxonomy determination (in bp), default: 1000" >&2
+ echo "-G: Maximum number of Gaussian mixture clusters used for sequence k-mer clustering, default: 10" >&2
+ echo "-C: Significance level of the chi-square distribution used to filter k-mer clusters by Mahalanobis distance, default: 0.005" >&2
+ echo "-Z: Z-score threshold for GC-content outlier classification, default: 2.5" >&2
+ echo "-W: Multiplier for the DIAMOND hit set weight comparison; a scaffold is flagged as a contaminant if non-target weight > W × target weight (must be satisfied together with -c), default: 1.2" >&2
+ echo "-c: Minimum non-target DIAMOND hit set coverage fraction of a scaffold required for contaminant classification (must be satisfied together with -W), default: 0.2" >&2
+ echo "-R: Multiplier for the Kraken2 k-mer fraction comparison; a scaffold is flagged as a contaminant if non-target fraction > R × target fraction (must be satisfied together with -r), default: 1.2" >&2
+ echo "-r: Minimum non-target Kraken2 k-mer fraction required for contaminant classification (must be satisfied together with -R), default: 0.05" >&2
+ echo "-A: Minimum Kraken2 k-mer fraction required to assign a taxon to a scaffold, default: 0.1" >&2
+ echo "-a: Minimum Kraken2 relative k-mer fraction required to assign a taxon to a scaffold (normalized by the total number of classified k-mers per scaffold), default: 0.5" >&2
+ echo "-B: Minimum DIAMOND hit set coverage fraction required to assign a taxon to a scaffold, default: 0.25" >&2
+ echo "-b: Minimum DIAMOND hit set relative coverage fraction required to assign a taxon to a scaffold (normalized by the total length of DIAMOND hit sets per scaffold), default: 0.5" >&2
+ echo "General options:" >&2
+ echo "-t: Number of CPU threads, default: 10" >&2
+ echo "-D: Output directory name, default: GENOME_decontamination_dir" >&2
+ echo "-O: Overwrite the output directory, default: off" >&2
+ echo "-h: Show usage information" >&2
+ exit 0
+}
+
+#Adding date and time to log messages (function)
+write_log () {
+ local LOG_TYPE="${1}"
+ shift 1
+ local MESSAGE="${*}"
+ echo "$(date '+%d/%m/%Y %H:%M:%S'):${LOG_TYPE}: ${MESSAGE}" >&2
+}
+
+#Checking executables (function)
+check_executables () {
+ for EXECUTABLE in "${@}"
+ do
+  if ! [[ -x $(command -v "${EXECUTABLE}") ]]
+  then
+   write_log ERROR "${EXECUTABLE} could not be found. Please check the supplied path"
+   exit 1
+  fi
+ done
+}
+
+#Checking R package installation (function)
+check_r_package () {
+ for R_PACKAGE in "${@}"
+ do
+  Rscript -e "if (!requireNamespace('${R_PACKAGE}', quietly=T)) quit(status=1)" >/dev/null 2>&1 || {
+   write_log ERROR "R package ${R_PACKAGE} could not be found"
+   exit 1
+  }
+ done
+}
+
+#Checking the supplied file (function)
+check_file () {
+ local FILE="${1}"
+ if [[ -f "${FILE}" ]]
+ then
+  if ! [[ -s "${FILE}" ]]
+  then
+   write_log ERROR "${FILE} is empty"
+   exit 1
+  fi
+ else
+  write_log ERROR "${FILE} cannot be found (or is not a file). Please check the supplied path"
+  exit 1
+ fi
+}
+
+#Checking the supplied supplemental files (function)
+check_supp_files () {
+ for FILE in "${@}"
+ do
+  if [[ -n "${FILE}" ]]
+  then
+   check_file "${FILE}"
+  fi
+ done
+}
+
+#Linking the supplied supplemental files to working directory (function)
+link_supp_files () {
+ for FILE in "${@}"
+ do
+  if [[ -n "${FILE}" ]]
+  then
+   ln -s -r -t "${OUT_DIR}" "${FILE}"
+  fi
+ done
+}
+
+#Checking the exit status of the last command (function)
+check_exit_status () {
+ local EXIT_STATUS="${?}"
+ local MESSAGE="${*}"
+ if [[ "${EXIT_STATUS}" -ne 0 ]]
+ then
+  write_log ERROR "${MESSAGE}"
+  exit 1
+ fi
+}
+
+#Testing numerical argument (function)
+test_numeric_arg () {
+ local NUM_REGEX='^[0-9]+(\.[0-9]+)?$'
+ local NUMERIC_ARG="${1}"
+ local VAR_NAME="${2}"
+ local ARG_DEF_VALUE="${3}"
+ shift 3
+ local MESSAGE="${*}"
+ if [[ -n "${NUMERIC_ARG}" && ! "${NUMERIC_ARG}" =~ ${NUM_REGEX} ]]
+ then
+  export "${VAR_NAME}"="${ARG_DEF_VALUE}"
+  write_log WARNING "${MESSAGE}"
+ fi
+}
+
+#Defining default parameters
+DIAMOND_PRESET="--sensitive"
+DIAMOND_GENOME_SPLIT_N=1
+DIAMOND_NR_SPLIT_N=2
+SEED=100
+SCAFF_LEN_MIN=1000
+MCLUST_G_MAX=10
+CHISQ_ALPHA=0.005
+GC_Z_THR=2.5
+DIA_WEIGHT_RATIO_MULT=1.2
+DIA_COV_FRACTION_THR=0.2
+KRAKEN_KMER_FRACTION_RATIO_THR=1.2
+KRAKEN_KMER_FRACTION_THR=0.05
+KRAKEN_KMER_FRACTION_TAX_ASSIGN_THR=0.1
+KRAKEN_CLASSIF_KMER_FRACTION_TAX_ASSIGN_THR=0.5
+DIA_COV_FRACTION_TAX_ASSIGN_THR=0.25
+DIA_REL_COV_FRACTION_TAX_ASSIGN_THR=0.5
+THREAD_N=10
+OVERWRITE_RES="F"
+
+#Saving the script call
+CALL="$(echo "${0} ${@}")"
+
+#Defining options
+while getopts ":n:d:m:k:K:T:fg:s:S:L:G:C:Z:W:c:R:r:A:a:B:b:t:D:Oh" OPT; do
+ case "${OPT}" in
+  n) DIAMOND_NR_DB="${OPTARG}"
+     ;;
+  d) DIAMOND_NONMEGAN_RES="${OPTARG}"
+     ;;
+  m) DIAMOND_MEGAN_RES="${OPTARG}"
+     ;;
+  k) KRAKEN_CORE_NT_DB="${OPTARG}"
+     ;;
+  K) KRAKEN_RES="${OPTARG}"
+    ;;
+  T) TAXONOMIZR_DB="${OPTARG}"
+    ;;
+  f) DIAMOND_PRESET="--fast"
+    ;;
+  g) DIAMOND_GENOME_SPLIT_N="${OPTARG}"
+    ;;
+  s) DIAMOND_NR_SPLIT_N="${OPTARG}"
+    ;;
+  S) SEED="${OPTARG}"
+    ;;
+  L) SCAFF_LEN_MIN="${OPTARG}"
+    ;;
+  G) MCLUST_G_MAX="${OPTARG}"
+    ;;
+  C) CHISQ_ALPHA="${OPTARG}"
+    ;;
+  Z) GC_Z_THR="${OPTARG}"
+    ;;
+  W) DIA_WEIGHT_RATIO_MULT="${OPTARG}"
+    ;;
+  c) DIA_COV_FRACTION_THR="${OPTARG}"
+    ;;
+  R) KRAKEN_KMER_FRACTION_RATIO_THR="${OPTARG}"
+    ;;
+  r) KRAKEN_KMER_FRACTION_THR="${OPTARG}"
+    ;;
+  A) KRAKEN_KMER_FRACTION_TAX_ASSIGN_THR="${OPTARG}"
+    ;;
+  a) KRAKEN_CLASSIF_KMER_FRACTION_TAX_ASSIGN_THR="${OPTARG}"
+    ;;
+  B) DIA_COV_FRACTION_TAX_ASSIGN_THR="${OPTARG}"
+    ;;
+  b) DIA_REL_COV_FRACTION_TAX_ASSIGN_THR="${OPTARG}"
+    ;;
+  t) THREAD_N="${OPTARG}"
+    ;;
+  D) OUT_DIR="${OPTARG}"
+    ;;
+  O) OVERWRITE_RES="T"
+     ;;
+  h) usage
+     ;;
+  ?) write_log ERROR "Unknown flag supplied: -${OPTARG}"
+     exit 1
+     ;;
+ esac
+done
+shift "$(( OPTIND - 1 ))"
+
+#Checking executable requirements
+check_executables diamond daa2info Rscript
+
+if [[ -z "${DIAMOND_MEGAN_RES}" ]]
+then
+ check_executables daa-meganizer
+fi
+
+if [[ -z "${KRAKEN_CORE_NT_DB}" ]]
+then
+ check_executables kraken2-build
+fi
+
+if [[ -z "${KRAKEN_RES}" ]]
+then
+ check_executables kraken2
+fi
+
+#Checking R package requirements
+check_r_package data.table taxonomizr Biostrings compositions mclust umap ggplot2 GenomicRanges
+
+#Displaying usage when calling the script without arguments
+if [[ "${#}" -eq 0 ]]
+then
+ usage
+fi
+
+#Save log output to file and STDERR
+LOG_FILE="Decontamination_run_$(date '+%Y%m%d_%H%M%S')"
+exec 3>&2
+exec 2> >(tee "$LOG_FILE" >&3)
+
+#Printing initial message
+echo "Genome decontamination pipeline, version 1.0.0"
+
+#Checking if the correct number of arguments is supplied
+if [[ "${#}" -ne 2 ]]
+ then
+ write_log ERROR "Invalid number of supplied arguments"
+ exit 1
+fi
+
+#Assigning positional arguments
+GENOME="${1}"
+TARGET_TAXON="${2}"
+
+#Checking the supplied files
+check_file "${GENOME}"
+check_supp_files "${DIAMOND_NR_DB}" "${DIAMOND_NONMEGAN_RES}" "${DIAMOND_MEGAN_RES}" "${KRAKEN_CORE_NT_DB}" "${KRAKEN_RES}" "${TAXONOMIZR_DB}"
+
+#Checking the target taxon argument
+if [[ ! "${TARGET_TAXON}" =~ ^(Viruses|Bacteria|Archaea|Metazoa|Fungi|Viridiplantae|Haptophyta|Rhodophyta|Stramenopiles|Alveolata|Excavata|Rhizaria|Choanoflagellata|Amoebozoa)$ ]]
+then
+ write_log ERROR "Target taxon is not in the allowed kingdom-level taxon list"
+ exit 1
+fi
+
+#Setting the default output directory name
+if [[ -z "${OUT_DIR}" ]]
+then
+ OUT_DIR="$(basename "${GENOME}")_decontamination_dir"
+fi
+
+#Checking the overwrite argument
+if [[ -d "${OUT_DIR}" || -f "${OUT_DIR}" ]]
+then
+ if [[ "${OVERWRITE_RES}" = "F" ]]
+ then
+  write_log ERROR "The output directory already exists and the overwrite option is turned off"
+  exit 1
+ elif [[ "${OVERWRITE_RES}" = "T" ]]
+ then
+  rm -r "${OUT_DIR}"
+ fi
+fi
+
+#Testing numerical arguments
+test_numeric_arg "${DIAMOND_GENOME_SPLIT_N}" "DIAMOND_GENOME_SPLIT_N" 1 "Supplied an incorrect value for number of splits performed on the genome, defaulting to 1"
+test_numeric_arg "${DIAMOND_NR_SPLIT_N}" "DIAMOND_NR_SPLIT_N" 2 "Supplied an incorrect value for number of splits performed on the DIAMOND NR database, defaulting to 2"
+test_numeric_arg "${SEED}" "SEED" 100 "Supplied an incorrect value for the random seed for reproducibility, defaulting to 100"
+test_numeric_arg "${SCAFF_LEN_MIN}" "SCAFF_LEN_MIN" 1000 "Supplied an incorrect value for the minimum scaffold length for taxonomy determination, defaulting to 1000"
+test_numeric_arg "${MCLUST_G_MAX}" "MCLUST_G_MAX" 10 "Supplied an incorrect value for the maximum number of Gaussian mixture clusters used for sequence k-mer clustering, defaulting to 10"
+test_numeric_arg "${CHISQ_ALPHA}" "CHISQ_ALPHA" 0.005 "Supplied an incorrect value for the significance level of the chi-square distribution used to filter k-mer clusters by Mahalanobis distance, defaulting to 0.005"
+test_numeric_arg "${GC_Z_THR}" "GC_Z_THR" 2.5 "Supplied an incorrect value for the Z-score threshold for GC-content outlier classification, defaulting to 2.5"
+test_numeric_arg "${DIA_WEIGHT_RATIO_MULT}" "DIA_WEIGHT_RATIO_MULT" 1.2 "Supplied an incorrect value for the multiplier for the DIAMOND hit set weight comparison, defaulting to 1.2"
+test_numeric_arg "${DIA_COV_FRACTION_THR}" "DIA_COV_FRACTION_THR" 0.2 "Supplied an incorrect value for the minimum non-target DIAMOND hit set coverage fraction of a scaffold required for contaminant classification, defaulting to 0.2"
+test_numeric_arg "${KRAKEN_KMER_FRACTION_RATIO_THR}" "KRAKEN_KMER_FRACTION_RATIO_THR" 1.2 "Supplied an incorrect value for the multiplier for the Kraken2 k-mer fraction comparison, defaulting to 1.2"
+test_numeric_arg "${KRAKEN_KMER_FRACTION_THR}" "KRAKEN_KMER_FRACTION_THR" 0.05 "Supplied an incorrect value for the minimum non-target Kraken2 k-mer fraction required for contaminant classification, defaulting to 0.05"
+test_numeric_arg "${KRAKEN_KMER_FRACTION_TAX_ASSIGN_THR}" "KRAKEN_KMER_FRACTION_TAX_ASSIGN_THR" 0.1 "Supplied an incorrect value for the minimum Kraken2 k-mer fraction required to assign a taxon to a scaffold, defaulting to 0.1"
+test_numeric_arg "${KRAKEN_CLASSIF_KMER_FRACTION_TAX_ASSIGN_THR}" "KRAKEN_CLASSIF_KMER_FRACTION_TAX_ASSIGN_THR" 0.5 "Supplied an incorrect value for the minimum Kraken2 relative k-mer fraction required to assign a taxon to a scaffold, defaulting to 0.5"
+test_numeric_arg "${DIA_COV_FRACTION_TAX_ASSIGN_THR}" "DIA_COV_FRACTION_TAX_ASSIGN_THR" 0.25 "Supplied an incorrect value for the minimum DIAMOND hit set coverage fraction required to assign a taxon to a scaffold, defaulting to 0.25"
+test_numeric_arg "${DIA_REL_COV_FRACTION_TAX_ASSIGN_THR}" "DIA_REL_COV_FRACTION_TAX_ASSIGN_THR" 0.5 "Supplied an incorrect value for the minimum DIAMOND hit set relative coverage fraction required to assign a taxon to a scaffold, defaulting to 0.5"
+test_numeric_arg "${THREAD_N}" "THREAD_N" 10 "Supplied an incorrect value for the number of CPU threads, defaulting to 10"
+
+#Creating the output directory
+mkdir "${OUT_DIR}"
+check_exit_status "Creating the output directory failed"
+
+#Creating symbolic links
+ln -s -r -t "${OUT_DIR}" "${GENOME}"
+GENOME="$(basename "${GENOME}")"
+link_supp_files "${DIAMOND_NR_DB}" "${DIAMOND_NONMEGAN_RES}" "${DIAMOND_MEGAN_RES}" "${KRAKEN_CORE_NT_DB}" "${KRAKEN_RES}" "${TAXONOMIZR_DB}"
+cd "${OUT_DIR}"
+
+#Writing the script call to file
+echo "${CALL}" > call_log
+
+#Downloading the newest version of NCBI NR database. Creating DIAMOND NR database
+if [[ -z "${DIAMOND_NR_DB}" && -z "${DIAMOND_NONMEGAN_RES}" && -z "${DIAMOND_MEGAN_RES}" ]]
+then
+ write_log INFO "Downloading NCBI NR database"
+ curl -fL "https://ftp.ncbi.nlm.nih.gov/blast/db/FASTA/nr.gz" -o nr.gz
+ check_exit_status "NCBI NR database failed to download"
+
+ write_log INFO "Downloading NCBI taxonomy mapping files"
+ curl -fL "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/prot.accession2taxid.gz" -o prot.accession2taxid.gz
+ check_exit_status "NCBI prot.accession2taxid file failed to download"
+ gunzip prot.accession2taxid.gz
+
+ curl -fL "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz" -o taxdump.tar.gz
+ check_exit_status "NCBI taxdump file failed to download"
+ tar -xzf taxdump.tar.gz
+
+ write_log INFO "Creating DIAMOND NR database"
+ diamond makedb --in nr.gz --taxonmap prot.accession2taxid --taxonnodes nodes.dmp --taxonnames names.dmp --threads "${THREAD_N}" --db nr 2> diamond_makedb_log
+ check_exit_status "Failed to create DIAMOND NR database"
+
+ DIAMOND_NR_DB="nr.dmnd"
+fi
+
+#Performing whole-genome DIAMOND search against NCBI NR database
+if [[ -z "${DIAMOND_NONMEGAN_RES}" && -z "${DIAMOND_MEGAN_RES}" ]]
+then
+ write_log INFO "Performing whole-genome DIAMOND search against NCBI NR database"
+ diamond blastx -q "${GENOME}" -d "${DIAMOND_NR_DB}" "${DIAMOND_PRESET}" -e 1e-5 --range-culling -F 15 --top 10 -c "${DIAMOND_GENOME_SPLIT_N}" -b "${DIAMOND_NR_SPLIT_N}" -p "${THREAD_N}" -t . -f 100 -o "${GENOME}.daa" 2> diamond_log
+ check_exit_status "DIAMOND run failed"
+ DIAMOND_NONMEGAN_RES="${GENOME}.daa"
+fi
+
+#Downloading MEGAN taxonomy mapping database
+if [[ -z "${DIAMOND_MEGAN_RES}" ]]
+then
+ write_log INFO "Downloading MEGAN taxonomy mapping database"
+ curl -fL "https://software-ab.cs.uni-tuebingen.de/download/megan7/megan-nr-r2.zip" -o megan-nr-r2.zip
+ check_exit_status "MEGAN taxonomy download failed"
+ unzip megan-nr-r2.zip
+fi
+
+#Meganizing DIAMOND output
+if [[ -z "${DIAMOND_MEGAN_RES}" ]]
+then
+ write_log INFO "Meganizing DIAMOND output"
+ daa-meganizer -i "${GENOME}.daa" -mdb megan-nr-r2.mdb -alg longReads -lg -me 1e-5 -t "${THREAD_N}" 2> daa_meganizer_log
+ check_exit_status "DIAMOND output meganization failed"
+ DIAMOND_MEGAN_RES="${GENOME}.daa"
+fi
+
+#Converting the DIAMOND output to blast6 format
+write_log INFO "Converting the DIAMOND output to blast6 format"
+diamond view --daa "${DIAMOND_MEGAN_RES}" --top 100 --threads "${THREAD_N}" --out "${GENOME}.blast6" 2> diamond_view_log
+check_exit_status "DIAMOND output format conversion failed"
+
+#Extracting LCA taxonomy assignments from meganized DIAMOND output
+write_log INFO "Extracting LCA taxonomy assignments from meganized DIAMOND output"
+daa2info -i "${DIAMOND_MEGAN_RES}" -r -r2c Taxonomy -o "${GENOME}_megan_lca.tsv" 2> daa2info_log
+check_exit_status "LCA taxonomy extraction failed"
+
+#Downloading the newest version of NCBI core NT database Kraken2 index
+if [[ -z "${KRAKEN_CORE_NT_DB}" && -z "${KRAKEN_RES}" ]]
+then
+ write_log INFO "Downloading NCBI core NT database Kraken2 index"
+ curl -fL "https://genome-idx.s3.amazonaws.com/kraken/k2_core_nt_20251015.tar.gz" -o kraken2_core_nt.tar.gz
+ check_exit_status "NCBI core NT database Kraken2 index failed to download"
+ mkdir kraken2_core_nt
+ tar -xzf kraken2_core_nt.tar.gz -C kraken2_core_nt
+ KRAKEN_CORE_NT_DB="kraken2_core_nt"
+fi
+
+#Performing whole-genome Kraken2 search against NCBI core NT database
+if [[ -z "${KRAKEN_RES}" ]]
+then
+ write_log INFO "Performing whole-genome Kraken2 search against NCBI core NT database"
+ kraken2 --db "${KRAKEN_CORE_NT_DB}" --threads "${THREAD_N}" --output "${GENOME}_kraken_core_nt" "${GENOME}" 2> kraken2_log
+ check_exit_status "Kraken2 run failed"
+ KRAKEN_RES="${GENOME}_kraken_core_nt"
+fi
+
+#Building Taxonomizr database
+if [[ -z "${TAXONOMIZR_DB}" ]]
+then
+ write_log INFO "Building Taxonomizr database"
+ Rscript -e "taxonomizr::prepareDatabase(types='prot')" 2> taxonomizr_log
+ check_exit_status "Taxonomizr database failed to build"
+ TAXONOMIZR_DB="nameNode.sqlite"
+fi
+
+#Running contamination analysis
+write_log INFO "Running contamination analysis"
+contamination_analysis.R "${THREAD_N}" "${TAXONOMIZR_DB}" "${GENOME}" "${SCAFF_LEN_MIN}" "${SEED}" "${MCLUST_G_MAX}" "${CHISQ_ALPHA}" "${GC_Z_THR}" "${GENOME}.blast6" "${TARGET_TAXON}" "${DIA_WEIGHT_RATIO_MULT}" "${DIA_COV_FRACTION_THR}" "${GENOME}_megan_lca.tsv" "${KRAKEN_RES}" "${KRAKEN_KMER_FRACTION_RATIO_THR}" "${KRAKEN_KMER_FRACTION_THR}" "${KRAKEN_KMER_FRACTION_TAX_ASSIGN_THR}" "${KRAKEN_CLASSIF_KMER_FRACTION_TAX_ASSIGN_THR}" "${DIA_COV_FRACTION_TAX_ASSIGN_THR}" "${DIA_REL_COV_FRACTION_TAX_ASSIGN_THR}" 2> contamination_analysis_log
+check_exit_status "Contamination analysis failed"
+
+#Moving logs into a separate directory
+mkdir logs
+mv diamond_makedb_log diamond_log daa_meganizer_log diamond_view_log daa2info_log kraken2_log taxonomizr_log contamination_analysis_log logs 2> /dev/null
+
+#Calculating the total number of contaminants
+if [[ -f contaminant_sequences.fa ]]
+then
+ CONTAMINANT_N=$(grep -c ">" contaminant_sequences.fa)
+ SCAFFOLD_N=$(grep -c ">" "${GENOME}")
+ CONTAMINANT_PERC=$(awk -v c="${CONTAMINANT_N}" -v s="${SCAFFOLD_N}" \ 'BEGIN { if (s==0) print 0; else printf "%.2f", (c/s)*100 }')
+else
+ CONTAMINANT_N=0
+ CONTAMINANT_PERC=0
+fi
+
+#Printing the results
+echo "Contaminants found in ${GENOME}: ${CONTAMINANT_N} (${CONTAMINANT_PERC}%)"
+echo "Per-scaffold contamination stats can be found in the scaffold_contamination_info.tsv file"
+echo "Decontaminated genome can be found in the decontaminated_genome.fa file"
+echo "Taxonomy assignment of the detected contaminants can be found in the contaminant_scaffolds_taxonomy.tsv file"
+echo "Contaminant sequences can be found in the contaminant_sequences.fa file"
+
+#Exiting
+echo "Thank you for using the genome decontamination pipeline!"
+exit 0
