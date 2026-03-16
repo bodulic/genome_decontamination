@@ -1,6 +1,6 @@
 # Genome decontamination pipeline
 
-<img src="bacteria_logo.png" alt="Logo" width="160" height="160"/>
+<img src="bacteria_logo.png" alt="Logo" width="200" height="160"/>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-brightgreen)
