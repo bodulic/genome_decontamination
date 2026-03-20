@@ -83,7 +83,23 @@ check_file () {
  fi
 }
 
-#Checking the supplied supplemental files (function)
+#Checking the supplied directory (function)
+check_directory () {
+ local DIRECTORY="${1}"
+ if [[ -d "${DIRECTORY}" ]]
+ then
+  if [[ -z $(ls "${DIRECTORY}") ]]
+  then
+   write_log ERROR "${DIRECTORY} is empty"
+   exit 1
+  fi
+ else
+  write_log ERROR "${DIRECTORY} cannot be found (or is not a directory). Please check the supplied path"
+  exit 1
+ fi
+}
+
+#Checking the supplied supplementary file (function)
 check_supp_files () {
  for FILE in "${@}"
  do
@@ -94,7 +110,18 @@ check_supp_files () {
  done
 }
 
-#Linking the supplied supplemental files to working directory (function)
+#Checking the supplied supplementary directory (function)
+check_supp_directories () {
+ for DIRECTORY in "${@}"
+ do
+  if [[ -n "${DIRECTORY}" ]]
+  then
+   check_directory "${DIRECTORY}"
+  fi
+ done
+}
+
+#Linking the supplied supplemental files/directories to working directory (function)
 link_supp_files () {
  for FILE in "${@}"
  do
@@ -262,9 +289,10 @@ fi
 GENOME="${1}"
 TARGET_TAXON="${2}"
 
-#Checking the supplied files
+#Checking the supplied files / directories
 check_file "${GENOME}"
-check_supp_files "${DIAMOND_NR_DB}" "${DIAMOND_NONMEGAN_RES}" "${DIAMOND_MEGAN_RES}" "${KRAKEN_CORE_NT_DB}" "${KRAKEN_RES}" "${TAXONOMIZR_DB}"
+check_supp_files "${DIAMOND_NR_DB}" "${DIAMOND_NONMEGAN_RES}" "${DIAMOND_MEGAN_RES}" "${KRAKEN_RES}" "${TAXONOMIZR_DB}"
+check_supp_directories "${KRAKEN_CORE_NT_DB}"
 
 #Checking the target taxon argument
 if [[ ! "${TARGET_TAXON}" =~ ^(Viruses|Bacteria|Archaea|Metazoa|Fungi|Viridiplantae|Haptophyta|Rhodophyta|Stramenopiles|Alveolata|Excavata|Rhizaria|Choanoflagellata|Amoebozoa)$ ]]
@@ -318,6 +346,13 @@ check_exit_status "Creating the output directory failed"
 ln -s -r -t "${OUT_DIR}" "${GENOME}"
 GENOME="$(basename "${GENOME}")"
 link_supp_files "${DIAMOND_NR_DB}" "${DIAMOND_NONMEGAN_RES}" "${DIAMOND_MEGAN_RES}" "${KRAKEN_CORE_NT_DB}" "${KRAKEN_RES}" "${TAXONOMIZR_DB}"
+
+DIAMOND_NR_DB="$(basename "${DIAMOND_NR_DB}")"
+DIAMOND_NONMEGAN_RES="$(basename "${DIAMOND_NONMEGAN_RES}")"
+DIAMOND_MEGAN_RES="$(basename "${DIAMOND_MEGAN_RES}")"
+KRAKEN_CORE_NT_DB="$(basename "${KRAKEN_CORE_NT_DB}")"
+KRAKEN_RES="$(basename "${KRAKEN_RES}")"
+TAXONOMIZR_DB="$(basename "${TAXONOMIZR_DB}")"
 cd "${OUT_DIR}"
 
 #Writing the script call to file
