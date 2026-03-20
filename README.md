@@ -260,4 +260,5 @@ The pipeline produces several output files outlined below:
 
  # Changelog
 
+ Version 1.0.0: Bug fixes regarding supplementary file simbolic linking, March 20, 2026.
  Version 1.0.0: Initial commit, March 16, 2026.
